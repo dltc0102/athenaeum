@@ -71,7 +71,6 @@ o supabase -> db for progress
 # download for iphone with comic selection
 # make images draggable=False
 
-
 def color_msg(color: str, msg: str) -> str:
     colors = {
         'black': CFore.BLACK,
