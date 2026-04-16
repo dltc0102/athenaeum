@@ -3,7 +3,11 @@
 A personal use program that allows me to scrape comics from websites without having to deal with their advertisements.
 Won't be distributing.
 
-# v1.2.0
+# v1.0.1
+
+- FastAPI Implementation
+
+# v1.0.0
 
 - integrated comic_db into comic_scraper
 - changed chapter_processing to take into account other attributes such as release_day, comic_uid for certain domains, and if the comic is completed or not to reduce redundant scraping
@@ -33,7 +37,7 @@ Won't be distributing.
 - live console
 - live notifications of subscribed pings?
 
-# v1.1.0
+# v1.1.0 (old ver)
 
 - made comic_db in an attempt to refactor everything
   - used classes for better structure and to add more comic domains for ease of adaptability to different scraping generations
@@ -41,7 +45,7 @@ Won't be distributing.
   - used async for parallel downloads and batch downloads to expedite downloading process and resource gathering
   - use of async also allowed playwright (imitation library for scraping) to work faster and be more efficient
 
-# v 1.0.0
+# v 1.0.0 (old ver)
 
 - A main web page with a grid of 3 comics displayed per row. Each comic has a title, cover image and a read button.
 - Each comic chapter consists of the title - chapter number, a dropdown for easy skipping of chapter, the comic with no line breaks and seamless reading, and a 'next chapter' button at the end for ease of going to the next chapter.

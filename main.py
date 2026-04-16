@@ -1,20 +1,19 @@
-import os, time, requests, json, re, shutil, bs4, urllib, math
+import os, time, requests, json, re, shutil, bs4, urllib, math, binascii, discord, datetime, sys, traceback
 import datetime as dt
 from tqdm import tqdm
 from bs4 import BeautifulSoup
 from PIL import Image, ImageFile
 from colorama import Fore as CFore
 from colorama import Style as CStyle
-import datetime as dt
 from typing import *
 import asyncio, httpx, aiofiles
 import aiofiles.os as aios
-from tqdm import tqdm
 from playwright.async_api import async_playwright
 from urllib.parse import quote
 from sentence_transformers import SentenceTransformer
-import binascii, discord, datetime, sys
 from discord.ext import commands
+from discord import app_commands
+from dotenv import load_dotenv
 
 
 
@@ -30,38 +29,39 @@ o supabase -> db for progress
 
 """
 
+"""
+v1.0.1 Changes
++ Added check that if cover image is already in the directory, skip so that it doesn't redownload again
++ Added Archivist, a discord bot that sends error and other messages to notify the user.
++ Added commands !start, !stop, !catalogue (add/remove/edit) 
++ Created API endpoints to prepare for svelte frontend
++ Temporarily removed Domain Utoon until they stop using cloudflare
++ Memray showed 143k+ allocations of the Comparer LLM Model, which causes mem allocations of more than 5gb, therefore _shared_model was added to reduce that, loading the model ONCE, reusing it when needed and not creating one everytime.
++ Created airplane_mode.py to convert downloaded comics into epubs for offline reading. 
+"""
+
 
 """ DONE """
-# o config fixed for extra attributes: comic_uid, release_day, is_completed
-# o collect configs that need to be changed with 
-# o search_mangakatana added
-# o Domain asuracomics added
-# o Domain flamecomics added
-# o Domain omegacomics addded
-# o Domain kingofshojo added
-# o Domain mangakatana added, removed due to captcha on chapter urls, readded due to finding the urls just nested in a script tag in soup on init of goto url.
-# o Domain toonily added
-# o Domain mangafire added
-# o fixed Synopsis.remove_duplicates() from not actually removing dupes
-# o Added VRFGenerator for mangafire search function
-# o resouped asurascans
-# o fixed premium chapters being asked to be downloaded
-# o Domain vortexscans fixedd
-# o added minimal reading buffer if comic has lots of chapters (over 250, eleceed excused)
-# o Domain hivetoon removed
-# o Domain arenascans added
-# yakshascans no images loading, changed to ravenscans
-# o Domain ravenscans addded
-# o fixed stitch_images decoder error
+# check that if cover image filename is already in cover images, doesnt need to redownload again
+# added basic discord notifying messages
 
 """ Doing """
-# deal with configs to be updated after operation
+# if theres only one image, its possibly over the 65500 pixel limit, await self.split_image
+# add notifiers for soup method fails with a complex handler
 
 """ TODO CATALOG.PY """
 # smart downloads
 # progress.json garbage collector
-# check that if cover image filename is already in cover images, doesnt need to redownload again
+# update catalogue.json with updated configs and extra attributes
 # decimal chapters should be downloaded
+# Archivist Error Notifier
+# Archivist Start Command
+# Archivist Stop Command
+# Archivist add comic command ( with save)
+# Archivist catalogue search command
+# Archivist edit catalogue command (with save)
+# Archivist remove comic from catalogue command (with save)
+
 
 
 """ TODO PAGE.PY """
@@ -93,9 +93,21 @@ def color_msg(color: str, msg: str) -> str:
     return f"{colors[color.lower()]}{msg}{CStyle.RESET_ALL}"
 
 class Comparer:
+    _shared_model = None
+
     def __init__(self, list_of_configs: list[list[str]]):
         self.list_of_configs = list_of_configs
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')
+
+        if Comparer._shared_model is None:
+            print("Loading SentenceTransformer model (first and only time)")
+            Comparer._shared_model = SentenceTransformer('all-MiniLM-L6-v2')
+        
+        self.model = Comparer._shared_model
+
+        if not hasattr(Comparer, '_instance_count'):
+            Comparer._instance_count = 0
+        Comparer._instance_count += 1
+
         self.standard_threshold: float = 0.92
         self.english_threshold: float = 0.98
         self.dupes_to_delete_by_basename = self.get_dupes_by_base_name(self.list_of_configs)
@@ -247,14 +259,12 @@ class Synopsis:
             self.synopsis_tag(f"No dupes found. No review dupes to be dealt with.")
             return
         
-        # clean_config_list = []
-        # for config in current_config:
-            # if config in dupes:
-            #   comic_name = config[0]
-            #   if comic_name in self.config_changes, remove that comic_name item and then add [comic_name, ""]
-            
-            # if config not in dupes:
-            #     clean_config_list.append(config)
+        clean_config_list = current_config.copy()
+    
+        # Remove automatic dupes
+        for dupe in dupes:
+            if dupe in clean_config_list:
+                clean_config_list.remove(dupe)
             
         self.synopsis_tag(color_msg("red", f"{len(dupes)} duplicates without parentheses have been deleted. "))
 
@@ -432,12 +442,13 @@ class Synopsis:
         return
     
 class ControlPanel:
-    def __init__(self, headers: dict[str, str], async_client: httpx.AsyncClient):
+    def __init__(self, headers: dict[str, str], async_client: httpx.AsyncClient, archivist_inst):
         self.headers = headers
         self.async_client = async_client
+        self.archivist_inst = archivist_inst
         self.bookshelf = Bookshelf()
         self.comic_buffer_bypasses: list[str] = ["Eleceed"]
-        self.cover_images_dirpath = os.path.join(os.getcwd(), "cover_images_test")
+        self.cover_images_dirpath = os.path.join(os.getcwd(), "cover_images")
         self.possible_image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.svg'}
         self.cover_images: list[str] = []
 
@@ -451,6 +462,23 @@ class ControlPanel:
         self.dev_mode = 0
         self.configs_to_be_updated = []
         self.failed_fetches = []
+
+    def catch_and_notify(self, func):
+        """Decorator to catch errors and send to Discord"""
+        async def wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                await self.notify_error(f"Error in {func.__name__}: {str(e)}", error=e)
+                raise
+        return wrapper
+        
+    async def notify_message(self, message: str):
+        await self.archivist_inst.notify_message(message)
+
+    async def notify_error(self, message: str, error: Exception=None):
+        await self.archivist_inst.notify_error(message, error)
+        raise ValueError(message)
 
     def get_failed_fetches(self) -> list[str]:
         return self.failed_fetches
@@ -499,7 +527,7 @@ class ControlPanel:
         if domain_name == "vortexscans":
             res = res.replace(":", "%3A")
             
-        chars_to_remove = ["(", ")", ":", "\u2013", "\u2026", "!", "?", "%", ".", "~", ",", "+"]
+        chars_to_remove = ["(", ")", ":", "\u2013", "\u2026", "!", "?", "%", ".", "~", ",", "+", "/"]
         chars_to_replace = [" ", "'", "\u2019"]
 
         if domain_name in ["manga18", "manhuaus", "yakshascans", "manhwabuddy", "pornhwa", "kingofshojo", "ravenscans"]:
@@ -570,7 +598,7 @@ class ControlPanel:
             print(color_msg("red", f"Error during cleanup: {cleanup_error}"))
 
     def get_progress_of_comic(self, comic_name: str) -> int:
-        with open("progress_bup.json", 'r', encoding='utf-8') as p:
+        with open("progress.json", 'r', encoding='utf-8') as p:
             progress_data = json.load(p)
         if comic_name in progress_data.keys():
             return progress_data[comic_name]
@@ -606,13 +634,13 @@ class ControlPanel:
 
         if comic_domain == "asuracomics":
             series_url = "" if isinstance(comic_id, int) else comic_id
-            domain_instance = domain_class(given_config=config, comic_name=comic_name, series_url=series_url, headers=self.headers, async_client=self.async_client)
+            domain_instance = domain_class(given_config=config, comic_name=comic_name, series_url=series_url, headers=self.headers, async_client=self.async_client, archivist_inst=self.archivist_inst)
         
         elif comic_domain == "flamecomics":
-            domain_instance = domain_class(given_config=config, comic_name=comic_name, comic_id=comic_id, headers=self.headers, async_client=self.async_client)
+            domain_instance = domain_class(given_config=config, comic_name=comic_name, comic_id=comic_id, headers=self.headers, async_client=self.async_client, archivist_inst=self.archivist_inst)
 
         else:
-            domain_instance = domain_class(given_config=config, comic_name=comic_name, headers=self.headers, async_client=self.async_client)
+            domain_instance = domain_class(given_config=config, comic_name=comic_name, headers=self.headers, async_client=self.async_client, archivist_inst=self.archivist_inst)
         await domain_instance.initialize()
 
         accurate_comic_name: str = comic_name
@@ -623,8 +651,15 @@ class ControlPanel:
         comic_dirpath: str = self.bookshelf.setup_comic(accurate_comic_name)
         start_ch: str = domain_instance.get_first_chapter()
         latest_ch: str = domain_instance.get_latest_chapter()
+        if '-' in latest_ch:
+            temp_latest_ch = latest_ch.replace(" ", "").split("-")[0]
+            latest_ch = temp_latest_ch
+            
         chapters_list: list[str] = domain_instance.get_chapters_list()
-                
+        if chapters_list == []:
+            self.panel_tag(color_msg("lightyellow", f"This comic does not have chapters yet. Skipping."))
+            return
+        # # self.dev_tag(f'chapters_list: {chapters_list}')
 
         self.panel_tag(color_msg("lightyellow", f"Start CH #: {start_ch}"))
         self.panel_tag(color_msg("lightyellow", f"Latest CH #: {latest_ch}"))
@@ -635,22 +670,24 @@ class ControlPanel:
         # if progress of comic is less than 10, keep minimal reading buffer of as much as possible, high limit of this for 100
         # if progress of comic == latest_chapter or near the latest chapter (like say 35%), and comic status is ongoing, try for next possible chapter
         
-        minimum_reading_buffer: int = 100
+        minimum_reading_buffer: int = 300
         chapters_left: list[str] = await domain_instance.get_chapters_left(comic_dirpath, chapters_list)
+        # # self.dev_tag(f'chapters_left: {chapters_left}')
         downloaded_chapters: int = int(math.floor(float(latest_ch))) - len(chapters_left)
-        # use_buffer = False
-        # if len(chapters_list) > 250 and downloaded_chapters == 0:
-        #     if accurate_comic_name not in self.comic_buffer_bypasses: # if comic name is in bypass list, skip this
-        #         self.panel_tag(color_msg('lightblue', f'Comic has too many chapters left ({len(chapters_left)} left), only downloading a suitable amount.'))
-        #         if self.get_progress_of_comic(comic_name) == minimum_reading_buffer and len(chapters_left) != 0:
-        #             pass
-        #         elif downloaded_chapters > 100:
-        #             chapters_left = chapters_left[:minimum_reading_buffer]
-        #             return
-        #         if downloaded_chapters < minimum_reading_buffer:
-        #             self.panel_tag(color_msg('lightyellow', 'Comic has too little chapters, downloading enough for minimum reading buffer.'))
-        #             chapters_left = chapters_left[:minimum_reading_buffer]
-        #             pass
+        # # self.dev_tag(f'downloaded_chapters: {downloaded_chapters}')
+        use_buffer = False
+        if len(chapters_list) > 400 and downloaded_chapters < 1:
+            if accurate_comic_name not in self.comic_buffer_bypasses: # if comic name is in bypass list, skip this
+                self.panel_tag(color_msg('lightblue', f'Comic has too many chapters left ({len(chapters_left)} left), only downloading a suitable amount.'))
+                if self.get_progress_of_comic(comic_name) == minimum_reading_buffer and len(chapters_left) != 0:
+                    pass
+                elif downloaded_chapters > 100:
+                    chapters_left = chapters_left[:minimum_reading_buffer]
+                    return
+                if downloaded_chapters < minimum_reading_buffer:
+                    self.panel_tag(color_msg('lightyellow', 'Comic has too little chapters, downloading enough for minimum reading buffer.'))
+                    chapters_left = chapters_left[:minimum_reading_buffer]
+                    pass
 
         if downloaded_chapters < 0: downloaded_chapters = 0
         self.panel_tag(color_msg("yellow", f"Downloaded Chapters: {downloaded_chapters}"))
@@ -685,43 +722,58 @@ class ControlPanel:
         if comic_domain == "flamecomics" or comic_domain == "vortexscans":
             chapter_to_start_on = int(chapters_left[0])
             chapter_links = await domain_instance.get_chapter_links_list()
-            chapter_items = list(enumerate(chapter_links, chapter_to_start_on-1))
+            chapter_items = []
+            for idx, link in enumerate(chapter_links, chapter_to_start_on-1):
+                match = re.search(r'/chapter-(\d+)', link)
+                if match:
+                    actual_chapter_num = match.group(1)
+                    chapter_items.append((actual_chapter_num, link))
+            # self.dev_tag(chapter_to_start_on)
+            # self.dev_tag(chapter_links)
+            # self.dev_tag(chapter_items)
         else:
             chapter_items = [(i, ch) for i, ch in enumerate(chapters_left, 1)]
         
-        # if len(chapter_items) > 250 and accurate_comic_name not in self.comic_buffer_bypasses:
-        #     return
-        # self.dev_tag(f'chapter_items: {chapter_items}')
+        if len(chapter_items) > 550 and accurate_comic_name not in self.comic_buffer_bypasses:
+            print(f"chapter items are over 550, there are {len(chapter_items)} chapter items")
+            return
         
         # flamecomics uses idx for ints because the chapter url formation are made of unique id links
+        from_chapter = chapter_items[0][1]
+        to_chapter = chapter_items[-1][1]
+        show_chapter_str = f"{from_chapter}-{to_chapter}"
+        if from_chapter == to_chapter:
+            show_chapter_str = from_chapter
+        await self.notify_message(f"> {comic_name} ({comic_domain}): Downloading Chapters... {show_chapter_str}")
         for idx, chapter_num in chapter_items:
-            if comic_domain != "flamecomics":
+            if comic_domain not in ["flamecomics", "vortexscans"]:
                 chapter_num = chapter_num.replace(".", "-")
             link_start = time.time()
-            if comic_domain == "flamecomics":
+            if comic_domain in ["flamecomics", "vortexscans"]:
                 chapter_image_links = await domain_instance.get_chapter_image_links(ch_num=idx)
             else:
                 chapter_image_links = await domain_instance.get_chapter_image_links(ch_num=chapter_num)
             
+            # self.dev_tag(f'controlpanel.comic_redirect() for loop: chapter_image_links: {chapter_image_links}')
             link_time = time.time() - link_start
             progress.log_step("Get links", link_time)
             
             if not chapter_image_links:
-                if comic_domain == "flamecomics" or comic_domain == "vortexscans":
+                if comic_domain in ["flamecomics", "vortexscans"]:
                     progress.update_chapter(idx)
                 else:
                     progress.update_chapter(chapter_num)
-                raise ValueError(color_msg("yellow", f"No images for chapter {chapter_num}"))
+                await self.notify_error(color_msg("yellow", f"ControlPanel.comic_redirect():\n > Domain: {comic_domain}\n > Comic: {comic_soup_name}\n > No images for chapter {chapter_num}"))
         
             process_start = time.time()
-            if comic_domain == "flamecomics" or comic_domain == "vortexscans":
+            if comic_domain in ["flamecomics", "vortexscans"]:
                 await domain_instance.batch_process(chapter_image_links, TEMP_DIR, str(idx), comic_dirpath)
             else:
                 await domain_instance.batch_process(chapter_image_links, TEMP_DIR, chapter_num, comic_dirpath)
             process_time = time.time() - process_start
             progress.log_step("Process", process_time)
             
-            if comic_domain == "flamecomics" or comic_domain == "vortexscans":
+            if comic_domain in ["flamecomics", "vortexscans"]:
                 progress.update_chapter(idx)
             else:
                 progress.update_chapter(chapter_num)  
@@ -736,15 +788,17 @@ class ChapterProgressBar:
         self.pbar = None
         
     def start(self):
-        self.pbar = tqdm(total=self.total_chapters, desc="Processing chapters", bar_format="{l_bar}{bar}{r_bar}", leave=False)
+        self.pbar = tqdm(total=self.total_chapters, desc="Processing chapters", bar_format="{l_bar}{bar}{r_bar}", leave=False, position=0)
         
     def update_chapter(self, chapter_num: str):
         self.current_chapter += 1
         self.pbar.set_description(f"Ch {chapter_num}")
         self.pbar.update(1)
+        self.pbar.refresh()
         
     def log_step(self, step: str, time_taken: float):
         self.pbar.set_postfix_str(f"{step}: {time_taken:.1f}s")
+        self.pbar.refresh()
         
     def close(self):
         if self.pbar:
@@ -752,7 +806,7 @@ class ChapterProgressBar:
 
 class Bookshelf:
     def __init__(self):
-        self.bookshelf_dirpath = os.path.join(os.getcwd(), "Bookshelf_test")
+        self.bookshelf_dirpath = os.path.join(os.getcwd(), "Bookshelf")
         self._ensure_bookshelf_dir()
         self.progress_comics: dict[str, str] = {}
 
@@ -801,8 +855,8 @@ class Bookshelf:
             return self.register_comic(normalised_name)
 
 class Downloader(ControlPanel):
-    def __init__(self, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
     
     async def get_soup(self, url: str) -> Optional[BeautifulSoup]:
         res = await self.get_url_response(url)
@@ -840,7 +894,31 @@ class Downloader(ControlPanel):
                 existing_chapters.add(chapter_str)
         
         chapters_left = [chapter for chapter in chapters if chapter not in existing_chapters]
-        return chapters_left
+        sorted_int_chapters_left = []
+        extra_attribs_chapters: dict[str, str] = {}
+        for chapter in chapters_left:
+            if '.' in chapter:
+                if "-" in chapter:
+                    temp_chapter = chapter.replace(" ", "")
+                    chapter_number_part = temp_chapter.split("-")[0]
+                    sorted_int_chapters_left.append(float(chapter_number_part))
+                else:
+                    sorted_int_chapters_left.append(float(chapter))
+            else:
+                if "-" in chapter:
+                    temp_chapter = chapter.replace(" ", "")
+                    number_part = temp_chapter.split("-")[0]
+                    if "fixed" in chapter:
+                        extra_attribs_chapters[str(number_part)] = chapter
+                    sorted_int_chapters_left.append(int(number_part))
+                else:
+                    sorted_int_chapters_left.append(int(chapter))
+
+        chapters_left_str = [str(chapter) for chapter in sorted(sorted_int_chapters_left)]
+        for ch in chapters_left_str:
+            if ch in extra_attribs_chapters.keys():
+                ch = extra_attribs_chapters[ch]
+        return chapters_left_str
     
     def handle_srcset(self, element) -> str:
         srcset = element.get("srcset", "")
@@ -868,7 +946,10 @@ class Downloader(ControlPanel):
             
     async def batch_process(self, links_list: list[str], temp_dirpath: str, chapter_number: str, comic_dirpath: str):
         img_paths = await self.batch_download(links_list, temp_dirpath, chapter_number)
-        await self.stitch_images(img_paths, temp_dirpath, comic_dirpath, chapter_number)
+        if len(img_paths) == 1:
+            await self.split_image(img_paths, temp_dirpath, comic_dirpath, chapter_number)
+        else:
+            await self.stitch_images(img_paths, temp_dirpath, comic_dirpath, chapter_number)
         await reset_dir(temp_dirpath)
 
     async def batch_download(self, links_list: list[str], temp_dirpath: str, chapter_number: str):
@@ -895,15 +976,19 @@ class Downloader(ControlPanel):
         
         return img_paths
 
+    def extract_fragment_number(self, path: str) -> int:
+        filename = os.path.basename(path)
+        match = re.search(r"f(\d+)\.", filename)
+        return int(match.group(1)) if match else 0
+
+    def get_image_object(self, path: str) -> Image:
+        return Image.open(path)
+    
     async def stitch_images(self, img_paths: list[str], temp_dirpath: str, comic_dirpath: str, chapter_number: str):
         os.makedirs(comic_dirpath, exist_ok=True)
+        # # self.dev_tag(f'running stitch images\nlen img_paths: {len(img_paths)}: {img_paths}, chapter_number: {chapter_number}')
         
-        def extract_fragment_number(path: str) -> int:
-            filename = os.path.basename(path)
-            match = re.search(r"f(\d+)\.", filename)
-            return int(match.group(1)) if match else 0
-        
-        img_paths.sort(key=extract_fragment_number)
+        img_paths.sort(key=self.extract_fragment_number)
         
         valid_img_paths = []
         for img_path in img_paths:
@@ -971,6 +1056,8 @@ class Downloader(ControlPanel):
                 original_images.append(img)
                 
                 width, height = img.size
+                if width < 1 or height < 1:
+                    await self.notify_error(f'Downloader.stitch_images():\n > width/height is less than 1. width: {width}, height: {height}, img_path: {img_path}')
                 
                 if width > min_width:
                     ratio = min_width / width
@@ -1013,6 +1100,60 @@ class Downloader(ControlPanel):
         
         # print(f"Stitched {len(stitched_paths)} pages to {comic_dirpath}")
 
+    async def split_image(self, img_paths: list[str], temp_dirpath: str, comic_dirpath: str, chapter_number: str):
+        os.makedirs(comic_dirpath, exist_ok=True)
+        img_filepath: str = img_paths[0]
+        img_filename: str = img_filepath.split("/")[-1]
+        max_height: int = 65500
+        img_object: Image = self.get_image_object(img_filepath)
+        img_w, img_h = img_object.size
+        img_mode = img_object.mode
+
+        if img_object.mode == 'P':
+            img_object = img_object.convert('RGB')
+        elif img_mode == "RGBA":
+            background = Image.new('RGB', img_object.size, (255, 255, 255))
+            background.paste(img_object, mask=img_object.split()[-1])
+            img_object = background
+        elif img_mode != "RGB" or img_object == "P" or img_mode != "L":
+            img_object = img_object.convert("RGB")
+
+        if img_h < max_height:
+            part_filename = re.sub(r'f(\d+)\.', r'p\1.', img_filename)
+            new_img_filepath = os.path.join(comic_dirpath, part_filename)
+
+            img_object.save(new_img_filepath)
+            img_object.close()
+            return
+
+        def get_filename_chnum(filename: str) -> tuple[int, int]:
+            chapter_pattern = re.compile(r"^chapter\-(\d+)\-f\d+\.(jpg|png|webp|jpeg|gif)$")
+            match = re.search(chapter_pattern, filename)
+            if match:
+                chapter_number = match.group(1)
+                extension = match.group(2)
+                return chapter_number, extension
+
+        img_filename_attrs = get_filename_chnum(filename=img_filename)
+        chapter_number: int = img_filename_attrs[0]
+        filename_ext: str = img_filename_attrs[1]
+        num_chunks: int = math.ceil(img_h / max_height)
+        chunk_height: int = math.ceil(img_h / num_chunks)
+
+        chunk_paths = []
+        os.remove(img_filepath)
+        for idx in range(num_chunks):
+            top_coord = idx * chunk_height
+            bot_coord = min((idx + 1) * chunk_height, img_h)
+            cropped_img = img_object.crop((0, top_coord, img_w, bot_coord))
+            chunk_filename = f'chapter-{chapter_number}-p{idx+1}.{filename_ext}'
+            chunk_filepath = os.path.join(comic_dirpath, chunk_filename)
+            cropped_img.save(chunk_filepath)
+            chunk_paths.append(filename_ext)
+        
+        img_object.close()
+        return
+
     def is_cloudflare_blocked(self, response: httpx.Response) -> bool:
         """Check if response indicates Cloudflare blocking/challenge"""
         if response is None:
@@ -1041,7 +1182,7 @@ class Downloader(ControlPanel):
 
         is_valid_cover: bool = await self.validate_image_link(link)
         if not is_valid_cover:
-            raise ValueError(color_msg("yellow", "Comic cover image link is not valid."))
+            await self.notify_error(color_msg("yellow", f"Downloader.process_cover_image():\n > Comic cover image link is not valid.\n > Link: {link}"))
         
         cover_img_filename: str = self.get_cover_img_fname(self.comic_name, link)
         cover_img_filepath: str = os.path.join(self.cover_images_dirpath, cover_img_filename)
@@ -1117,7 +1258,7 @@ class Downloader(ControlPanel):
 
         return src_links
 
-    async def get_valid_image_links(self, tag_list: list[str], domain_name: str, src_value: str, extra_attribute: str=None):
+    async def get_valid_image_links(self, tag_list: list[str], domain_name: str, src_value: str, comic_name: str, chapter_num: int,extra_attribute: str=None):
         valid_links: int = 0
         valid_links_list: list[str] = []
         for img_tag in tag_list:
@@ -1146,10 +1287,11 @@ class Downloader(ControlPanel):
                 valid_links_list.append(img_link)
 
         if len(valid_links_list) == len(tag_list) - 5:
-            self.dev_tag('one image is invalid, continuing')
+            # self.dev_tag('one image is invalid, continuing')
             return valid_links_list
         else:
             print(color_msg("lightgreen", f"Chapter Links Validated ({domain_name}): {valid_links}/{len(tag_list)}"))
+            # await self.notify_message(f"({domain_name}) Downloading {comic_name} Ch {chapter_num}: {valid_links}/{len(tag_list)}")
             return valid_links_list
 
     async def get_dynamic_soup(self, url: str, selector: str, domain: str):
@@ -1346,169 +1488,73 @@ class VRFGenerator:
             b"=").replace(b"+", b"-").replace(b"/", b"_").decode()
 
 class Archivist:
-    def __init__(self, webhook_url: str):
-        self.webhook_url: str = webhook_url
+    def __init__(self, async_client):
+        self.async_client = async_client
+        load_dotenv()
+        self.discord_token: str = os.getenv("DISCORD_TOKEN")
+        self.webhook_url: str = os.getenv("WEBHOOK_URL")
         self.intents = discord.Intents.default()
         self.intents.message_content = True
         self.intents.messages = True
-        self.bot = commands.Bot(command_prefix="!", intents=self.intents)
         self.bot_channel = "comic-scraper"
+        self.bot = commands.Bot(command_prefix="!", intents=self.intents)
+        # self.tree = app_commands.CommandTree(self)
     
-    async def run_main_file(self, ctx):
-        self.output_channel = ctx.channel
-        await ctx.send("Starting main.py")
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, "main.py", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=os.path.dirname(os.path.abspath(__file__))
-        )
-        self.current_process = process
-        async def read_output(pipe):
-            while True:
-                line = await pipe.readline()
-                if not line:
-                    break
-                line = line.decode().strip()
-                if line:
-                    if len(line) > 1900:
-                        line = line[:1900] + "..."
-                    await ctx.send(f"```\n{line}\n```")
-                    
-        await asyncio.gather(
-            read_output(process.stdout),
-            read_output(process.stderr)
-        )
-        return_code = await process.wait()
-        if return_code == 0:
-            await ctx.send("✅ Comic downloader completed successfully!")
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(self.handle_loop_exception)
+
+        @self.bot.event
+        async def on_ready():
+            print(f"we are ready! {self.bot.user.name}")
+
+        # @self.bot.tree.command()
+        # @app_commands.describe(
+        #     first_value='The first value you want to add something to',
+        #     second_value='The value you want to add to the first value',
+        # )
+        # async def add(interaction: discord.Interaction, first_value: int, second_value: int):
+        #     """Adds two numbers together."""
+        #     await interaction.response.send_message(f'{first_value} + {second_value} = {first_value + second_value}')
+
+
+    def handle_loop_exception(self, loop, context):
+        """Global exception handler for the event loop"""
+        exception = context.get('exception')
+        message = context.get('message', 'Unknown error')
+        
+        if exception:
+            asyncio.create_task(self.notify_error(f"Unhandled error: {message}", exception))
         else:
-            await ctx.send(f"❌ Comic downloader failed with exit code: {return_code}")
+            asyncio.create_task(self.notify_error(f"Unhandled error: {message}"))
+
+    async def run_bot(self):
+        await self.bot.start(self.discord_token)
+
+    async def close_bot(self):
+        await self.bot.close()
+
+    async def notify_message(self, message: str) -> None:
+        await self.async_client.post(self.webhook_url, json={"content": message})
+
+    async def notify_error(self, message: str, error: Exception = None) -> None:
+        if error:
+            tb_str = traceback.format_exec()
+            if len(tb_str) > 1500: tb_str = tb_str[:1500] + "... (truncated)"
+            full_message = f"🚨 **Error:** {message}\n\n```python\n{tb_str}\n```"
+        else:
+            full_message = f"🚨 **Error:** {message}"
+
+        if error:
+            traceback.print_exc()
+
+        await self.async_client.post(self.webhook_url, json={"content": f"{full_message}"})
+
+
         
-    
-    def notify_new_chapter(self, message: str):
-        embed = {
-            "title": "New Chapter",
-            "description": message,
-            "color": 0x00ff00,
-            "timestamp": datetime.utcnow().isoformat(),
-            "footer": {
-                "text": "Archivist Updating..."
-            }
-        }
-        data = {
-            "embeds": [embed]
-        }
-        response = requests.post(self.webhook_url, data=json.dumps(data), headers={ "Content Type": "application/json" })
-        response.raise_for_status()
-        return True
-
-    def notify(self, content):
-        response = requests.post(
-            self.webhook_url,
-            data=json.dumps({"content": content}),
-            headers={"Content-Type": "application/json"}
-        )
-        response.raise_for_status()
-        return True
-
-
 """ Domains """
-class Template(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
-        self.given_config: list[str] = given_config
-        self.comic_name: str = comic_name
-        self.protocol: str = "https://protocol.com"
-        self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "template_domain")
-        # if needed
-        self.comic_uid = self.given_config[2]
-        self.release_day = self.given_config[3]
-        self.is_completed = self.given_config[4]
-
-        self.comic_url: str = f""
-        self.comic_template_url: str = f""
-        self.panel_tag(f'{color_msg('lightyellow', 'self.url_comic_name:')} {color_msg('white', self.url_comic_name)}')
-        self.panel_tag(f'{color_msg('lightyellow', 'self.comic_url:')} {color_msg('white', self.comic_url)}')
-        self.panel_tag(f'{color_msg('lightyellow', 'self.comic_template_url:')} {color_msg('white', self.comic_template_url)}')
-
-    async def initialize(self):
-        details = await self.get_comic_details()
-        self.comic_soup_name: str       = details["soup_name"]
-        self.comic_cover_img_link: str  = details["cover_img_link"]
-        self.comic_status: str          = details["status"]
-        self.chapters_list: list[str]   = details["chapters_list"]
-        self.first_chapter: str         = details["first_chapter"]
-        self.latest_chapter: str        = details["latest_chapter"]
-        self.generated_config: list[str] = [self.comic_soup_name, "template_domain", 0, "everyday", True if self.comic_status != "ongoing" else False]
-        if self.generated_config != self.given_config:
-            self.configs_to_be_updated.append(self.generated_config)
-
-        if self.dev_mode == 1:
-            for k, v in details.items():
-                print(f'{k}: {v}')
-
-    async def get_comic_details(self) -> dict:
-        comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
-        if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
-    
-        comic_soup_name: str = ""
-
-        comic_cover_img_link: str = ""
-        await self.process_cover_image(comic_cover_img_link)
-
-        comic_status: str = "ongoing"
-
-        chapters_list: list[str] = []
-        first_chapter: str = ""
-        latest_chapter: str = ""
-
-        print(comic_soup_name)
-        print(comic_cover_img_link)
-        print(comic_status)
-        print(chapters_list)
-        print(first_chapter)
-        print(latest_chapter)
-
-        return {
-            'soup_name': comic_soup_name,
-            'cover_img_link': comic_cover_img_link,
-            'status': comic_status,
-            'chapters_list': chapters_list,
-            'first_chapter': first_chapter,
-            'latest_chapter': latest_chapter
-        }
-
-    def get_comic_soup_name(self) -> str:
-        return self.comic_soup_name
-    
-    def get_first_chapter(self) -> str:
-        return self.first_chapter
-
-    def get_latest_chapter(self) -> str:
-        return self.latest_chapter
-
-    def get_chapters_list(self) -> list[str]:
-        return self.chapters_list
-    
-    async def get_chapter_image_links(self, ch_num: str) -> list[str]:
-        comic_chapter_url: str = self.comic_template_url.format(ch_num)
-        backup_url: str = ""
-        chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
-        if chapter_soup is None and backup_url:
-            chapter_soup = await self.get_soup(backup_url)
-        
-        validated_chapter_links: list[str] = []
-        img_tags = chapter_soup.find_all("img")
-        for img_tag in img_tags:
-            if img_tag.has_attr("alt") and img_tag.has_attr("src"):
-                img_link = img_tag.get("src").strip()
-                is_valid: bool = await self.validate_image_link(img_link)
-                if is_valid:
-                    validated_chapter_links.append(img_link)
-        return validated_chapter_links
-
 class Manga18(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name = comic_name
         self.protocol: str = "https://manga18.me"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "manga18")
@@ -1538,7 +1584,7 @@ class Manga18(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Manga18.get_comic_details():\n > ailed to fetch comic page: {self.comic_url}")
         
         comic_soup_name: str = comic_soup.find("div", class_="post-title wleft").select_one("h1").text.strip()
         comic_cover_img_link: str = comic_soup.find("div", class_="summary_image").select_one("img").get("src").strip()
@@ -1588,11 +1634,11 @@ class Manga18(Downloader):
         # Running get_chapter_image_links (manga18.me): comic_soup_name: {self.comic_soup_name}"))
         chapter_alt_check: str = f"{self.comic_soup_name} - Chapter {ch_num}"
         chapter_image_tags: list[str] = chapter_soup.find("div", class_="read-content wleft").find_all('img')
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="manga18.me", src_value="src", extra_attribute=chapter_alt_check)
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="manga18.me", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num, extra_attribute=chapter_alt_check)
 
 class Mgeko(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://www.mgeko.cc"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "mgeko")
@@ -1633,7 +1679,7 @@ class Mgeko(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Mgeko.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
         
         comic_soup_name: str = comic_soup.find("h1", class_="novel-title text2row").text.strip()
         comic_cover_img_link: str = comic_soup.find("div", class_="fixed-img").find("figure", class_="cover").select_one("img").get("data-src").strip()
@@ -1687,11 +1733,11 @@ class Mgeko(Downloader):
             chapter_soup = await self.get_soup(backup_url)
 
         chapter_image_tags: list[str] = [tag for tag in chapter_soup.find("div", id="chapter-reader").find_all("img") if tag.has_attr("id") and tag["id"].startswith("image-")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="mgeko", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="mgeko", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class Manhuaus(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://manhuaus.com"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "manhuaus")
@@ -1723,7 +1769,7 @@ class Manhuaus(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Manhuaus.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
 
         comic_soup_name: str = comic_soup.find("div", class_="post-title").select_one("h1").text.strip()
         comic_cover_img_link: str = comic_soup.find("div", class_="summary_image").select_one("img").get("data-src").strip()
@@ -1762,11 +1808,11 @@ class Manhuaus(Downloader):
         comic_chapter_url: str = self.comic_template_url.format(ch_num)
         chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
         chapter_image_tags: list[str] = [tag for tag in chapter_soup.find("div", class_="reading-content").find_all("img") if tag.has_attr("id") and tag["id"].startswith("image-")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="yakshascans", src_value="data-src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="yakshascans", src_value="data-src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class Yakshascans(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://yakshascans.com"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "yakshascans")
@@ -1796,7 +1842,7 @@ class Yakshascans(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Yakshascans.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
 
         comic_soup_name: str = comic_soup.find("div", class_="post-title").select_one("h1").text.strip()
         comic_cover_img_link: str = comic_soup.find("div", class_="summary_image").find("img").get("data-src").strip()
@@ -1836,11 +1882,11 @@ class Yakshascans(Downloader):
         # print(f'chapter_url: {comic_chapter_url}')
         chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
         chapter_image_tags: list[str] = [tag for tag in chapter_soup.find("div", class_="reading-content").find_all("img") if tag.has_attr("id") and tag["id"].startswith("image-")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="yakshascans", src_value="data-src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="yakshascans", src_value="data-src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class Ravenscans(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://ravenscans.org"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "ravenscans")
@@ -1870,17 +1916,21 @@ class Ravenscans(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Ravenscans.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
 
-        comic_soup_name: str = comic_soup.find("h1", class_="entry-title").get_text(strip=True)
+        comic_soup_name: str = comic_soup.find("h1", class_="entry-title").get_text(strip=True).replace("/", "")
         comic_cover_img_link: str = comic_soup.find("img", class_="attachment- size- wp-post-image").get("src").strip()
         await self.process_cover_image(comic_cover_img_link)
 
         comic_status: str = comic_soup.find("div", class_="imptdt").find("i").get_text(strip=True).lower()
 
         chapters_list: list[str] = list(reversed([tag.get_text(strip=True).lower().replace("chapter", "").strip() for tag in comic_soup.find("div", id="chapterlist").find_all("span", class_="chapternum")]))
-        first_chapter: str = chapters_list[0]
-        latest_chapter: str = chapters_list[-1]
+        if chapters_list == []:
+            first_chapter: str = '0'
+            latest_chapter: str = '0'
+        else:
+            first_chapter: str = chapters_list[0]
+            latest_chapter: str = chapters_list[-1]
 
         return {
             'soup_name': comic_soup_name,
@@ -1911,11 +1961,11 @@ class Ravenscans(Downloader):
         chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
         if not chapter_soup: chapter_soup = await self.get_dynamic_soup(url=comic_chapter_url, selector="#readerarea", domain="ravenscans")
         chapter_image_tags: list[str] = [tag for tag in chapter_soup.find("div", id="readerarea").find_all("img")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="ravenscans", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="ravenscans", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class Manhwabuddy(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://manhwabuddy.com"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "manhwabuddy")
@@ -1945,7 +1995,7 @@ class Manhwabuddy(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Manhwabuddy.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
 
         comic_soup_name: str = comic_soup.find("h1", class_="main-info-title title-bigger").text.strip()
         comic_cover_img_link: str = comic_soup.find("img", class_="img-cover").get("src").strip()
@@ -1985,11 +2035,11 @@ class Manhwabuddy(Downloader):
         # print(f'chapter_url: {comic_chapter_url}')
         chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
         chapter_image_tags: list[str] = chapter_soup.find("div", class_="reading-content").find_all("img")
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="manhwabuddy", src_value="data-src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="manhwabuddy", src_value="data-src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class Pornhwa(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://pornhwa.me"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "pornhwa")
@@ -2019,7 +2069,7 @@ class Pornhwa(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Pornhwa.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
 
         comic_soup_name: str = comic_soup.find("h1", class_="px-1 text-2xl text-left font-bold mb-5").text.strip()
         comic_cover_img_link: str = comic_soup.find("img", class_="w-32 h-full mx-auto border-4 border-solid border-slate-800 dark:border-white unset md:w-full md:border-8").get("src").strip()
@@ -2058,13 +2108,13 @@ class Pornhwa(Downloader):
         comic_chapter_url: str = self.comic_template_url.format(ch_num)
         chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
         chapter_image_tags: list[str] = [tag for tag in chapter_soup.find("div", id="bacaArea").find_all("img", class_="mx-auto") if tag.get("src") != "/banner.jpg"]
-        valid_links = await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="pornhwa.me", src_value="src")
-        # self.dev_tag(f'len(valid_links): {len(valid_links)}')
+        valid_links = await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="pornhwa.me", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
+        # # self.dev_tag(f'len(valid_links): {len(valid_links)}')
         return valid_links
 
 class Hentai20(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://hentai20.io"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "hentai20")
@@ -2095,7 +2145,7 @@ class Hentai20(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Hentai20.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
 
         comic_soup_name: str = comic_soup.find("h1", class_="entry-title").get_text().strip()
 
@@ -2134,16 +2184,16 @@ class Hentai20(Downloader):
     async def get_chapter_image_links(self, ch_num: str) -> list[str]:
         # print('running Hentai20.get_chapter_image_links()')
         comic_chapter_url: str = self.comic_template_url.format(ch_num)
-        if ch_num == "0" and self.comic_name.lower().strip() != "ground and pound":
+        chapter_soup = await self.get_soup(comic_chapter_url)
+        if ch_num == "0" and not chapter_soup:
             ch_num = "0-prologue"
             comic_chapter_url = self.comic_template_url.format(ch_num)
-
-        chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
-        if not chapter_soup:
-            self.dev_tag('used dynamic soup')
+            chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
+            if not chapter_soup:
+                chapter_soup = await self.get_dynamic_soup(url=comic_chapter_url, selector="#readerarea", domain="hentai20")
+        if ch_num != "0" and not chapter_soup:
             chapter_soup = await self.get_dynamic_soup(url=comic_chapter_url, selector="#readerarea", domain="hentai20")
-
-        # self.dev_tag(f"chapter_soup?: {"True" if chapter_soup else "False"}")
+        # # self.dev_tag(f"chapter_soup?: {"True" if chapter_soup else "False"}")
         # special subs in hentai20
         special_subs = {
             '-s-': 's-',
@@ -2157,15 +2207,15 @@ class Hentai20(Downloader):
         temp_url_name = self.url_comic_name
         for k, v in special_subs.items():
             temp_url_name = temp_url_name.replace(k, v)
-        # self.dev_tag(f'temp_url_name: {temp_url_name}')
+        # # self.dev_tag(f'temp_url_name: {temp_url_name}')
 
         chapter_image_tags: list[str] = chapter_soup.find("div", id="readerarea").find_all("img")
-        valid_links = await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="hentai20", src_value="src", extra_attribute=temp_url_name)
+        valid_links = await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="hentai20", src_value="src", extra_attribute=temp_url_name, comic_name=self.comic_soup_name, chapter_num=ch_num)
         return valid_links
 
 class AsuraComics(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, series_url: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, series_url: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.given_config: list[str] = given_config
         self.generated_config: list[str] = []
         self.comic_name: str = comic_name
@@ -2206,7 +2256,7 @@ class AsuraComics(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Asuracomics.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
         
         comic_soup_name: str = comic_soup.find("h1", class_="text-xl lg:text-[32px] font-semibold leading-tight").text.strip()
 
@@ -2265,8 +2315,8 @@ class AsuraComics(Downloader):
         if has_unicode_element:
             search_query = self.find_query_part(clean_query)
         
-        self.dev_tag(f'search asura query: {search_query}')
-        self.dev_tag(f'search url: {search_protocol.format(search_query.lower().strip())}')
+        # self.dev_tag(f'search asura query: {search_query}')
+        # self.dev_tag(f'search url: {search_protocol.format(search_query.lower().strip())}')
         response = requests.get(search_protocol.format(search_query.lower().strip()), headers=self.headers)
         if response.status_code != 200:
             self.dev_tag('not 200')
@@ -2310,8 +2360,8 @@ class AsuraComics(Downloader):
         return img_links
 
 class FlameComics(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, comic_id: int, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, comic_id: int, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://flamecomics.xyz"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "flamecomics")
@@ -2338,7 +2388,7 @@ class FlameComics(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch this comic page: {self.comic_url}")
+            await self.notify_error(f"Flamecomics.get_comic_details():\n > Failed to fetch this comic page: {self.comic_url}")
         
         comic_info_div = comic_soup.select_one(
             "div.SeriesPage_paper__MMnBx.m_1b7284a3.mantine-Paper-root[style]"
@@ -2398,11 +2448,11 @@ class FlameComics(Downloader):
         comic_chapter_soup: Optional[BeautifulSoup] = await self.get_soup(comic_chapter_url)
         img_tags = comic_chapter_soup.find_all("img")
         chapter_image_tags = [tag for tag in img_tags if tag and tag.has_attr("src") and tag["src"].startswith("https://cdn.flamecomics.xyz/uploads/images/series")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="flamecomics", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="flamecomics", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class OmegaScans(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://omegascans.org"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "omegascans")
@@ -2434,7 +2484,7 @@ class OmegaScans(Downloader):
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
             if not comic_soup:
-                raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+                await self.notify_error(f"Omegascans.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
     
         comic_soup_name: str = comic_soup.find("div", id="content").find("h1", class_="text-xl md:text-3xl text-foreground font-bold text-center lg:text-left inline").text.strip()
 
@@ -2507,11 +2557,11 @@ class OmegaScans(Downloader):
         
         img_tags = chapter_soup.find_all("img")
         chapter_image_tags = [tag for tag in img_tags if tag.has_attr("src") and tag["src"].startswith("https://media.omegascans.org/file/")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="omegascans", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="omegascans", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class KingOfShojo(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.comic_name: str = comic_name
         self.protocol: str = "https://kingofshojo.com"
         self.url_comic_name: str = self.get_url_comic_name(self.comic_name, "kingofshojo")
@@ -2541,7 +2591,7 @@ class KingOfShojo(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Kingofshojo.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
 
         comic_soup_name: str = comic_soup.find("h1", class_="entry-title").text.strip()
         
@@ -2598,11 +2648,11 @@ class KingOfShojo(Downloader):
 
         img_tags = chapter_soup.find_all("img")
         chapter_image_tags = [tag for tag in img_tags if tag.has_attr("title") and tag["title"].strip().startswith(f"{self.comic_soup_name.strip()} Chapter {ch_num}") and tag.has_attr("src")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="kingofshojo", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="kingofshojo", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class MangaKatana(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.given_config: list[str] = given_config
         self.comic_name: str = comic_name
         self.protocol: str = "https://mangakatana.com"
@@ -2640,7 +2690,7 @@ class MangaKatana(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Mangakatana.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
         
         comic_soup_name: str = comic_soup.find("div", class_="info").find("h1", class_="heading").text.strip()
 
@@ -2699,8 +2749,8 @@ class MangaKatana(Downloader):
         return img_url_array
         
 class Toonily(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.given_config: list[str] = given_config
         self.comic_name: str = comic_name
         self.protocol: str = "https://toonily.com"
@@ -2738,7 +2788,7 @@ class Toonily(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Toonily.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
     
         comic_soup_name: str = comic_soup.find("div", class_="post-title").find("h1").get_text(strip=True)
 
@@ -2788,11 +2838,11 @@ class Toonily(Downloader):
         
         img_tags = chapter_soup.find_all("img")
         chapter_image_tags = [tag for tag in img_tags if tag.has_attr("id") and tag["id"].startswith("image-") and tag.has_attr("src") and "data.tnlycdn.com" in tag["src"]]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="toonily", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="toonily", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class MangaFire(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.given_config: list[str] = given_config
         self.comic_name: str = comic_name
         self.protocol: str = "https://mangafire.to"
@@ -2889,11 +2939,11 @@ class MangaFire(Downloader):
         
         img_tags = chapter_soup.select('div.img.loaded img.fit-w')
         chapter_image_tags = [tag for tag in img_tags if tag.has_attr("src") and "mfcdn1.xyz/mf" in tag["src"]]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="mangafire", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="mangafire", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class VortexScans(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.given_config: list[str] = given_config
         self.comic_name: str = comic_name
         self.protocol: str = "https://vortexscans.org"
@@ -2906,6 +2956,7 @@ class VortexScans(Downloader):
 
         self.comic_url: str = f"{self.protocol}/series/{self.url_comic_name}"
         self.comic_template_url: str = f"{self.protocol}/series/{self.weird_url_comic_name}/chapter-{{}}"
+        # self.dev_tag(f'vortexscans __INIT__ self.comic_template_url: {self.comic_template_url}')
         self.panel_tag(f'{color_msg('lightyellow', 'self.url_comic_name:')} {color_msg('white', self.url_comic_name)}')
         self.panel_tag(f'{color_msg('lightyellow', 'self.comic_url:')} {color_msg('white', self.comic_url)}')
         self.panel_tag(f'{color_msg('lightyellow', 'self.comic_template_url:')} {color_msg('white', self.comic_template_url)}')
@@ -2918,6 +2969,7 @@ class VortexScans(Downloader):
         self.chapters_list: list[str]   = details["chapters_list"]
         self.first_chapter: str         = details["first_chapter"]
         self.latest_chapter: str        = details["latest_chapter"]
+        self.premium_chapters: list[str] = details["premium_chapters"]
         self.generated_config: list[str] = [self.comic_soup_name, "vortexscans", 0, "everyday", True if self.comic_status != "ongoing" else False]
         if self.generated_config != self.given_config:
             self.configs_to_be_updated.append(self.generated_config)
@@ -2929,7 +2981,7 @@ class VortexScans(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Vortexscans.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
     
         comic_soup_name_element = comic_soup.find("h1", class_="text-2xl font-bold text-foreground leading-[1.5rem]")
 
@@ -2943,7 +2995,7 @@ class VortexScans(Downloader):
             if comic_cover_img_link_element:
                 comic_soup_name: str = comic_cover_img_link_element.get("alt").strip()
             else:
-                raise ValueError("could not find comic_soup_name through comic_cover_img_link_element")
+               await self.notify_error ("Vortexscans.get_comic_details()\n > Could not find comic_soup_name through comic_cover_img_link_element")
         else: 
             comic_soup_name: str = comic_soup_name_element.get_text(strip=True)
 
@@ -2979,6 +3031,7 @@ class VortexScans(Downloader):
             'cover_img_link': comic_cover_img_link,
             'status': comic_status,
             'chapters_list': non_premium_chaps,
+            'premium_chapters': premium_chaps,
             'first_chapter': first_chapter,
             'latest_chapter': latest_chapter
         }
@@ -3008,7 +3061,8 @@ class VortexScans(Downloader):
 
                 for chapter_div in chapter_divs:
                     chapter_href = await chapter_div.get_attribute('href')
-                    if chapter_href:
+                    href_chapter_number = chapter_href.split("/")[-1].split("-")[-1]
+                    if chapter_href and str(href_chapter_number) not in self.premium_chapters:
                         chapter_link = f"https://vortexscans.org{chapter_href.strip()}"
                         chapter_links.append(chapter_link)
             await browser.close()
@@ -3030,15 +3084,38 @@ class VortexScans(Downloader):
     
     async def get_chapter_image_links(self, ch_num: str) -> list[str]:
         comic_chapter_url: str = self.comic_template_url.format(ch_num)
+        # # self.dev_tag(f'vortexscans.get_chapter_image_links(): \n > comic_chpater_url: {comic_chapter_url}\n > self.comic_template_url: {self.comic_template_url}\n > ch_num: {ch_num}')
+        # self.dev_tag(f"Building chapter URL with ch_num: {ch_num}")
+        # self.dev_tag(f"Comic template URL: {self.comic_template_url}")
+        # self.dev_tag(f"Final URL: {comic_chapter_url}")
         chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
         
-        img_tags = chapter_soup.find("div", class_="comic-images-wrapper").find_all("img")
-        chapter_image_tags = [tag for tag in img_tags if tag.has_attr("alt") and tag.has_attr("src") and tag["src"].startswith("https://storage.vexmanga.com/public/")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="vortexscans", src_value="src")
+        chapter_wrapper = chapter_soup.find("div", class_="comic-images-wrapper")
+        if not chapter_wrapper:
+            wrapper = chapter_soup.find("div", class_="comic-images-wrapper-reader-mode-strip")
+            if not wrapper:
+                img_links = await self.get_images_playwright_scroll(
+                    chapter_url=comic_chapter_url,
+                    regex_filter=r'^page-\d{4}_\d{2}_\d{13}\-\d{6}\.webp$',
+                    link_filter="storage.vortexcomics.org",
+                    img_element_filter="storage.vortexcomics.org",
+                    file_ext=".webp"
+                )
+                # self.dev_tag(f"Found {len(img_links)} images for chapter {ch_num}")
+                return img_links
+            else:
+                figures = wrapper.find_all("figure", item_type="https://schema.org/ImageObject")
+                chapter_image_tags = [tag.find("img").get("src").strip() for tag in figures]
+        else:
+            img_tags = chapter_wrapper.find_all("img")
+            chapter_image_tags = [tag for tag in img_tags if tag.has_attr("alt") and tag.has_attr("src") and tag["src"].startswith("https://storage.vexmanga.com/public/")]
+
+        self.dev_tag(f"Found {len(chapter_image_tags)} images for chapter {ch_num}")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="vortexscans", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
   
 class UToon(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.given_config: list[str] = given_config
         self.comic_name: str = comic_name
         self.protocol: str = "https://utoon.net"
@@ -3073,7 +3150,7 @@ class UToon(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"Utoon.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
     
         comic_soup_name: str = comic_soup.find("div", class_="c-breadcrumb-wrapper").find_all("a")[-1].get_text(strip=True)
 
@@ -3083,7 +3160,7 @@ class UToon(Downloader):
         comic_status: str = comic_soup.find("div", class_="post-status").find_all("div", class_="summary-content")[-1].get_text(strip=True).lower()
         
         chapters_list_wrapper = comic_soup.select('ul.main.version-chap.no-volumn li.wp-manga-chapter.has-thumb.free-chap')
-        chapters_list: list[str] = list(reversed([tag.find("a").text.replace("Chapter", "").strip() for tag in chapters_list_wrapper]))
+        chapters_list: list[str] = list(reversed([tag.find("a").text.replace("Chapter", "").replace("(Fixed)", "fixed").strip().replace(" ", "-") for tag in chapters_list_wrapper]))
         first_chapter: str = chapters_list[0]
         latest_chapter: str = chapters_list[-1]
 
@@ -3119,11 +3196,11 @@ class UToon(Downloader):
         
         img_tags = chapter_soup.find_all("img")
         chapter_image_tags = [tag for tag in img_tags if tag.has_attr("alt") and tag.has_attr("src")]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="utoon", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="utoon", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
 class HiveToon(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.given_config: list[str] = given_config
         self.comic_name: str = comic_name
         self.protocol: str = "https://hivetoons.org"
@@ -3159,7 +3236,7 @@ class HiveToon(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"HiveToon.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
     
         comic_soup_name: str = comic_soup.find("h1", class_="text-2xl font-bold text-foreground leading-[1.5rem]").text.strip()
 
@@ -3206,7 +3283,7 @@ class HiveToon(Downloader):
 
         img_tags = chapter_soup.select('div.image-container img[src*="storage.hivetoon.com/public/upload/"]')
         chapter_image_tags = [tag for tag in img_tags if "logo" not in tag.get("src").lower().strip()]
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="hivetoon", src_value="src")
+        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="hivetoon", src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num)
 
         # img_links = await self.persistent_instance.network_image_scraper({
         #     'chapter_url': comic_chapter_url,
@@ -3219,8 +3296,8 @@ class HiveToon(Downloader):
         # return img_links
 
 class ArenaScans(Downloader):
-    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None):
-        super().__init__(headers, async_client)
+    def __init__(self, given_config: list[str], comic_name: str, headers=None, async_client=None, archivist_inst=None):
+        super().__init__(headers, async_client, archivist_inst)
         self.given_config: list[str] = given_config
         self.comic_name: str = comic_name
         self.protocol: str = "https://arenascan.com"
@@ -3232,6 +3309,7 @@ class ArenaScans(Downloader):
 
         self.comic_url: str = f"{self.protocol}/manga/{self.url_comic_name}/"
         self.comic_template_url: str = f"{self.protocol}/{self.url_comic_name}-{{}}/"
+        self.backup_template_url: str = f"{self.protocol}/{self.url_comic_name}-chapter-{{}}"
         self.panel_tag(f'{color_msg('lightyellow', 'self.url_comic_name:')} {color_msg('white', self.url_comic_name)}')
         self.panel_tag(f'{color_msg('lightyellow', 'self.comic_url:')} {color_msg('white', self.comic_url)}')
         self.panel_tag(f'{color_msg('lightyellow', 'self.comic_template_url:')} {color_msg('white', self.comic_template_url)}')
@@ -3255,7 +3333,7 @@ class ArenaScans(Downloader):
     async def get_comic_details(self) -> dict:
         comic_soup: Optional[BeautifulSoup] = await self.get_soup(self.comic_url)
         if comic_soup is None:
-            raise ValueError(f"Failed to fetch comic page: {self.comic_url}")
+            await self.notify_error(f"ArenaScans.get_comic_details():\n > Failed to fetch comic page: {self.comic_url}")
     
         comic_soup_name: str = comic_soup.find("h1", class_="entry-title").get_text(strip=True)
 
@@ -3291,10 +3369,54 @@ class ArenaScans(Downloader):
     
     async def get_chapter_image_links(self, ch_num: str) -> list[str]:
         comic_chapter_url: str = self.comic_template_url.format(ch_num)
+        backup_chapter_url: str = self.backup_template_url.format(ch_num)
+        
+        chapter_image_wrappers = None
+        
         chapter_soup: BeautifulSoup = await self.get_soup(comic_chapter_url)
-        if not chapter_soup: chapter_soup = await self.get_dynamic_soup(url=comic_chapter_url, selector="#readerarea", domain="arenascans")
-        chapter_image_tags = chapter_soup.find("div", id="readerarea").find_all("img")
-        return await self.get_valid_image_links(tag_list=chapter_image_tags, domain_name="arenascans", src_value="src")
+        if chapter_soup:
+            chapter_image_wrappers = chapter_soup.find("div", id="readerarea")
+        
+        if not chapter_image_wrappers:
+            try:
+                dynamic_soup = await self.get_dynamic_soup(
+                    url=comic_chapter_url, 
+                    selector="#readerarea", 
+                    domain="arenascans"
+                )
+                if dynamic_soup:
+                    chapter_image_wrappers = dynamic_soup.find("div", id="readerarea")
+            except Exception as e:
+                self.dev_tag(f"Dynamic soup failed on primary URL: {e}")
+        
+        if not chapter_image_wrappers:
+            backup_soup = await self.get_soup(backup_chapter_url)
+            if backup_soup:
+                chapter_image_wrappers = backup_soup.find("div", id="readerarea")
+        
+        if not chapter_image_wrappers:
+            try:
+                backup_dynamic_soup = await self.get_dynamic_soup(
+                    url=backup_chapter_url, 
+                    selector="#readerarea", 
+                    domain="arenascans"
+                )
+                if backup_dynamic_soup:
+                    chapter_image_wrappers = backup_dynamic_soup.find("div", id="readerarea")
+            except Exception as e:
+                self.dev_tag(f"Dynamic soup failed on backup URL: {e}")
+        
+        if not chapter_image_wrappers:
+            self.dev_tag(f"Failed to find readerarea for chapter {ch_num}")
+            return []
+        
+        chapter_image_tags = chapter_image_wrappers.find_all("img")
+        return await self.get_valid_image_links(
+            tag_list=chapter_image_tags, 
+            domain_name="arenascans", 
+            src_value="src", comic_name=self.comic_soup_name, chapter_num=ch_num
+        )
+
 
 """ HELPER FUNCTIONS """
 
@@ -3388,6 +3510,8 @@ def get_test_config(config: list[list[str, str]]):
     return test_config
 
 async def main():
+    load_dotenv(".env")
+
     ImageFile.LOAD_TRUNCATED_IMAGES = True
     start_time: float = time.time()
     today_day = dt.datetime.now().strftime("%A").lower()
@@ -3399,35 +3523,76 @@ async def main():
     headers: dict[str, str] = { "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0", "Accept": "image/*" }
     async_client: httpx.AsyncClient = create_async_client(headers)
 
+    archivist_inst = Archivist(async_client)
+    bot_task = asyncio.create_task(archivist_inst.run_bot())
+    # await asyncio.sleep(5)
+
     catalogue: list[list[str, str]] = synopsis.get_config_comics()
     print(color_msg("green", f"Found {len(catalogue)} comics to scrape."))
 
     TEMP_DIR: str = os.path.join(os.getcwd(), "temp")
     await reset_dir(TEMP_DIR)
 
-    my_controls = ControlPanel(headers, async_client)
-    print('bookshelf_test directory reset.')
-    
+    my_controls = ControlPanel(headers, async_client, archivist_inst)
+    print("bookshelf directory has been reset")
     # await clean_progress_file("progress_copy.json", config) # do this only after comic names online are scraped
 
     num_str_list = [str(idx) for idx in range(0, 10)]
-    alphabet_list = list("ABCDEFGHIJKLMNOPQ")
+    alphabet_list = list("+-ABCDEFGHIJKLMNOPQR")
     ignore_list = num_str_list + alphabet_list
 
+    selected_comics: list[str] = [
+        "Switch ON Season 2",
+        "SSS-Class Undercover Agent",
+        "CCTV",
+        "Cleaning Service",
+        "Eleceed",
+        "Astral Pet Store",
+        "A World-Class Walkthrough",
+        "My Wife Is a Heavenly Big Shot",
+        "My Wife and I Dominate the Three Realms",
+        "Bug Player",
+        "Superhuman Era",
+        "Genius Martial Arts Trainer",
+        "How I Became an SSS Rank Delivery Hunter",
+        "Emperor of Solo Play",
+        "Return of the Mount Hua Sect",
+        "Solo Leveling: Ragnarok",
+        "Stockpiling Ten Thousand Tons of Pork During the Apocalypse",
+    ]
+    await my_controls.notify_message(f'> Starting to scrape!')
     for comic_config in catalogue:
         comic_name = comic_config[0]
         # first_letter = comic_name[0]
-        # if first_letter in ignore_list: continue
-        # if comic_name != "Eat Before You Go": continue
+        if comic_name not in selected_comics: continue
         domain = comic_config[1]
-        if domain != "ravenscans": continue
+        if domain in ["utoon", "vortexscans", "mangafire"]: continue
         await my_controls.comic_redirect(comic_config)
         await asyncio.sleep(2)
 
+    # Clean shutdown
     progress_comics = my_controls.get_progress_comics()
-    print(len(progress_comics))
+    print(f'\nprogress comics: {len(progress_comics)}')
+
     failed_fetches = my_controls.get_failed_fetches()
-    for idx in failed_fetches: print(idx)
+    print(f'\nfailed fetches: {len(failed_fetches)}')
+    for idx in failed_fetches: 
+        print(idx)
+
+    configs_to_update = my_controls.configs_to_be_updated
+    print(f'\nconfigs to be updated: {len(configs_to_update)}')
+    for idx in configs_to_update: 
+        print(idx)
+    
+    # Shut down the bot
+    print(color_msg("red", "Shutting down Discord bot..."))
+    await archivist_inst.close_bot()
+    bot_task.cancel()
+    
+    # Close the async client
+    await async_client.aclose()
+    
+    print(color_msg("green", "Shutdown complete."))
 
 if __name__ == "__main__":
     asyncio.run(main())
