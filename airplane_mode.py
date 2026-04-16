@@ -293,7 +293,8 @@ class Ebook:
         
         return chunks
 
-def delete_incomplete_directories():
+def setup_aero_dir(aero_dir: str):
+    os.makedirs(aero_dir, exist_ok=True)
     if os.path.exists("Aeronaeum"):
         files = os.listdir(os.path.join(os.getcwd(), "Aeronaeum"))
         for file in files: 
@@ -304,15 +305,16 @@ def delete_incomplete_directories():
     return
 
 def main():
-    delete_incomplete_directories()
+    aero_dirname: str = "Aeronaeum"
+    setup_aero_dir(aero_dirname)
     selected_comics: list[str] = [
         # "Switch ON Season 2",
         # "SSS-Class Undercover Agent",
         # "CCTV",
         # "Cleaning Service",
         "1 Second",
-        "Eleceed",
-        "Astral Pet Store",
+        # "Eleceed",
+        # "Astral Pet Store",
         "A World-Class Walkthrough",
         "My Wife Is a Heavenly Big Shot",
         "My Wife and I Dominate the Three Realms",
@@ -320,14 +322,14 @@ def main():
         "Bug Player",
         "Superhuman Era",
         "Genius Martial Arts Trainer",
-        # "How I Became an SSS Rank Delivery Hunter",
-        # "Emperor of Solo Play",
+        "How I Became an SSS Rank Delivery Hunter",
+        "Emperor of Solo Play",
         "Return of the Mount Hua Sect",
-        # "Solo Leveling: Ragnarok",
+        "Solo Leveling: Ragnarok",
         # "Stockpiling Ten Thousand Tons of Pork During the Apocalypse",
     ]
 
-    downloaded_epubs = [filename for filename in os.listdir(os.path.join(os.getcwd(), "Aeronaeum")) if filename.endswith(".epub")]
+    downloaded_epubs = [filename for filename in os.listdir(os.path.join(os.getcwd(), aero_dirname)) if filename.endswith(".epub")]
     ebooks = []
     for comic in selected_comics:
         check_filename = f"{comic}.epub"
