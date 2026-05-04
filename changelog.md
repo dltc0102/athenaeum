@@ -3,9 +3,55 @@
 A personal use program that allows me to scrape comics from websites without having to deal with their advertisements.
 Won't be distributing.
 
+""" TODO CATALOG.PY """
+o smart downloads
+o progress.json garbage collector
+o update catalogue.json with updated configs and extra attributes
+o for flamecomics, if comic_id and soup_name don't match with catalogue config name, then fix the comic_id
+o needs more retries for getting comic page and getting comic details
+
+""" TODO PAGE.PY """
+o categories: Pinned, recently read, recently updated, comics
+o connect page.py to new catalog.py
+o improve page.py with targeted comic request ('refresh' button?), or when reading certain comic, an async function will detect comic being read, and download according to chapters read per minute/day/hour
+o download for iphone with comic selection
+o make images draggable=False
+
+# v1.0.4 Changes:
+
+o Restructed to importing domain classmethods for ease of maintenance
+o Added logic to check catalogue.json for any updates after every comic scraped
+o Created API Endpoints using FastAPI
+o Created routes for SvelteJS frontend
+o Created favorites.json and archive.json for keeping track of respective data
+
+# v1.0.3
+
+Changes:
+o Added validation to skip re-downloading cover images if they already exist locally
+o Added basic Discord notification support (progress, error)
+o Added support for domains GenzToon and ManhwaReads
+o Added validation to skip premium_chapters when getting comic details for Domains (Vortexscans)
+o Refactored functions for getting chapters left and downloaded chapters to validate chapters that have special names and decimals to be downloaded
+o Added memory usage logs for local directories
+o Added retry attempts for the get_url_response()
+o Made functions for getting comic details in class methods for ease of maintenance and readability. (Omegascans so far)
+o Temporarily disabled mangafire domain and ravenscans domain
+
+# v1.0.2
+
+Changes:
+o Integrated Ebook into main.py to create ebooks while running scrape
+
 # v1.0.1
 
-- FastAPI Implementation
+o Added check that if cover image is already in the directory, skip so that it doesn't redownload again
+o Added Archivist, a discord bot that sends error and other messages to notify the user.
+o Added commands !start, !stop, !catalogue (add/remove/edit)
+o Created API endpoints to prepare for svelte frontend
+o Temporarily removed Domain Utoon until they stop using cloudflare
+o Memray showed 143k+ allocations of the Comparer LLM Model, which causes mem allocations of more than 5gb, therefore \_shared_model was added to reduce that, loading the model ONCE, reusing it when needed and not creating one everytime.
+o Created airplane_mode.py to convert downloaded comics into epubs for offline reading.
 
 # v1.0.0
 

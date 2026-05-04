@@ -1,34 +1,10 @@
-# to download specific comics with chapters for offline reading
-
-import os, shutil, zipfile, json, re, ebooklib, io
-from ebooklib import epub
+import re, os, shutil, io, json
+import pillow_avif
 from PIL import Image
+from ebooklib import epub
 from pathlib import Path
 from tqdm import tqdm
 
-
-""" Changelog 
-v1.0.1
-Fixes:
--   Problem: Aeronaeum folder for output was being reset everytime the program was run, thus completed downloads were being erased and 
-    extended the time taken for other comics to download.
-    Solution: Made sure that Aeronaeum folder is not deleted, but incomplete directories are
-
--   Problem: Splitting images for all chapters made the chunks folder too big (n_chapters*n_chunks)
-    Solution: For every 5 chapters of split image chunks, the chunks are added to epub and deleted from the chunk folder to reduce folder size.
-    Changes:
-        - removed airplane_temp directory
-
-Changes:
-- Reduced the __init__ function of Ebook classmethod to have less clutter, improving readability
-
-
------
-
-v1.0.0
-+ Converted comic pngs into cbz to be read in the cbz viewer
-
-"""
 class Ebook:
     def __init__(self, comic_config: str | list[str]):
         self.chapter_regex = re.compile(r"chapter-(\d+)-p(\d+)\.(webp|jpg|jpeg|png)")
@@ -292,59 +268,3 @@ class Ebook:
             chunks.append(chunk)
         
         return chunks
-
-def setup_aero_dir(aero_dir: str):
-    os.makedirs(aero_dir, exist_ok=True)
-    if os.path.exists("Aeronaeum"):
-        files = os.listdir(os.path.join(os.getcwd(), "Aeronaeum"))
-        for file in files: 
-            full_path_filepath = os.path.join(os.getcwd(), "Aeronaeum", file)
-            if os.path.isdir(full_path_filepath): 
-                shutil.rmtree(full_path_filepath)
-    print(f'Deleted Incomplete Epub Directories...\n\n')
-    return
-
-def main():
-    aero_dirname: str = "Aeronaeum"
-    setup_aero_dir(aero_dirname)
-    selected_comics: list[str] = [
-        # "Switch ON Season 2",
-        # "SSS-Class Undercover Agent",
-        # "CCTV",
-        # "Cleaning Service",
-        "1 Second",
-        # "Eleceed",
-        # "Astral Pet Store",
-        "A World-Class Walkthrough",
-        "My Wife Is a Heavenly Big Shot",
-        "My Wife and I Dominate the Three Realms",
-        # "Reality Quest",
-        "Bug Player",
-        "Superhuman Era",
-        "Genius Martial Arts Trainer",
-        "How I Became an SSS Rank Delivery Hunter",
-        "Emperor of Solo Play",
-        "Return of the Mount Hua Sect",
-        "Solo Leveling: Ragnarok",
-        # "Stockpiling Ten Thousand Tons of Pork During the Apocalypse",
-    ]
-
-    downloaded_epubs = [filename for filename in os.listdir(os.path.join(os.getcwd(), aero_dirname)) if filename.endswith(".epub")]
-    ebooks = []
-    for comic in selected_comics:
-        check_filename = f"{comic}.epub"
-        if check_filename in downloaded_epubs: 
-            print(f'\n{check_filename} is already in the Aeronaeum. Skipping...\n--------------------------------')
-            continue
-
-        ebook = Ebook(comic)
-        ebook.build()
-        ebook_filepath = ebook.get_epub_filepath()
-        print(f'Epub Written: {ebook_filepath}\n\n--------------------------------')
-        ebooks.append(ebook_filepath)
-    
-
-    
-    
-if __name__ == "__main__":
-    main()
